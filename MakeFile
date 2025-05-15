@@ -1,0 +1,24 @@
+# Variables
+CXX       := g++
+CXXFLAGS  := -std=c++17 -Wall -Wextra -O2
+INCLUDES  := -Iinclude
+SRCS      := $(wildcard src/*.cpp)
+OBJS      := $(SRCS:src/%.cpp=build/%.o)
+LIB       := libMapReduceFramework.a
+
+# Default target: build the library
+all: $(LIB)
+
+build/%.o: src/%.cpp | build
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(LIB): $(OBJS)
+	ar rcs $@ $^
+
+build:
+	mkdir -p build
+
+.PHONY: clean
+clean:
+	rm -rf build $(LIB)
+
