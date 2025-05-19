@@ -42,7 +42,6 @@ struct JobContext
     // shuffle queue
     std::vector<IntermediateVec> shuffleQueue;
     std::mutex shuffleMux;
-    std::atomic<size_t> shuffleCount{0};
 
     // barrier for end‐of‐sort
     Barrier barrier;
@@ -142,6 +141,7 @@ static void worker(ThreadContext *tc)
                 std::lock_guard<std::mutex> lg(job->shuffleMux);
                 job->shuffleQueue.emplace_back(std::move(group));
             }
+            job->shuffledSoFar.fetch_add(group.size(), std::memory_order_relaxed);
         }
         // signal reducers
         job->shuffleComplete.store(true, std::memory_order_release);
@@ -261,6 +261,9 @@ void waitForJob(JobHandle job)
                 t.join();
             }
         }
+        std::sort(jc->output->begin(), jc->output->end(),
+                  [](auto &a, auto &b)
+                  { return *(a.first) < *(b.first); });
     }
     // subsequent calls see threadsJoined==true and do nothing
 }
@@ -327,6 +330,69 @@ void getJobState(JobHandle job, JobState *state)
         state->percentage = 100.0f;
     }
 }
+
+// void getJobState(JobHandle job, JobState *state)
+// {
+//     if (!job || !state)
+//         return;
+//     auto jc = static_cast<JobContext *>(job);
+
+//     // Snapshot counters once
+//     size_t mapped = jc->mapIndex.load(std::memory_order_relaxed);
+//     size_t totalItems = jc->totalItems;
+//     size_t totalInt = jc->totalIntermediates.load(std::memory_order_relaxed);
+//     size_t shuffled = jc->shuffledSoFar.load(std::memory_order_relaxed);
+//     size_t reduced = jc->totalOutput.load(std::memory_order_relaxed);
+
+//     // 0) Before mapping starts
+//     if (mapped == 0)
+//     {
+//         state->stage = UNDEFINED_STAGE;
+//         state->percentage = 0.0f;
+//         return;
+//     }
+
+//     // 1) Map phase in progress
+//     if (mapped < totalItems)
+//     {
+//         state->stage = MAP_STAGE;
+//         state->percentage = (mapped * 100.0f) / totalItems;
+//         return;
+//     }
+
+//     // 2) Shuffle phase in progress
+//     if (shuffled < totalInt)
+//     {
+//         state->stage = SHUFFLE_STAGE;
+//         state->percentage = totalInt
+//                                 ? (shuffled * 100.0f) / totalInt
+//                                 : 100.0f;
+//         return;
+//     }
+
+//     // 2b) Shuffle just completed but reduce hasn't started
+//     //     Force a final 100% Shuffle print
+//     if (totalInt > 0 && reduced == 0)
+//     {
+//         state->stage = SHUFFLE_STAGE;
+//         state->percentage = 100.0f;
+//         return;
+//     }
+
+//     // 3) Reduce phase in progress
+//     if (reduced < totalInt)
+//     {
+//         state->stage = REDUCE_STAGE;
+//         state->percentage = totalInt
+//                                 ? (reduced * 100.0f) / totalInt
+//                                 : 100.0f;
+//         return;
+//     }
+
+//     // 4) All done
+//     state->stage = REDUCE_STAGE;
+//     state->percentage = 100.0f;
+// }
 
 void closeJobHandle(JobHandle job)
 {

@@ -1,7 +1,0 @@
-## ⏳ To do
-- [ ] Compile `libMapReduceFramework.a` via `make`
-- [ ] Run + validate `example/SampleClient`
-- [ ] Add unit tests (empty input, single thread, many threads)
-- [ ] Update `README.md` with build & usage instructions
-- [ ] Code-format review and inline documentation
-- [ ] Package tarball for submission

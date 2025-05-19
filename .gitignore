@@ -4,5 +4,19 @@
 *.so
 *.exe
 build/
-# VSCode settings
+
+# Editor configs
 .vscode/
+
+# Compiled outputs
+example/SampleClient
+tests/test1-1_thread_1_process
+tests/test4-1_thread_4_process
+
+# Test result outputs
+tests/test1_output.txt
+tests/test4_output.txt
+
+# Temp files
+*~
+*.swp
