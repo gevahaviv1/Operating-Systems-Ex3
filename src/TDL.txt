@@ -1,6 +1,4 @@
 ## ⏳ To do
-- [ ] Complete `worker()` logic with proper stage transitions
-- [ ] Initialize `shuffleCount = totalIntermediates` before shuffle
 - [ ] Compile `libMapReduceFramework.a` via `make`
 - [ ] Run + validate `example/SampleClient`
 - [ ] Add unit tests (empty input, single thread, many threads)
