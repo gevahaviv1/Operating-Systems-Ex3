@@ -16,13 +16,6 @@
 struct ThreadContext;
 struct JobContext;
 
-// Helper: report and exit on system failure
-static void sysError(const char *msg)
-{
-    std::cerr << "system error: " << msg << "\n";
-    std::exit(1);
-}
-
 // -- Internals (not in the header) ----------------------------------
 
 struct ThreadContext
@@ -59,8 +52,9 @@ struct JobContext
 
     // progress tracking
     std::atomic<size_t> mapIndex{0};
-    size_t totalItems;
     std::atomic<size_t> shuffledSoFar{0};
+    std::atomic<bool> shuffleComplete{false};
+    size_t totalItems;
 
     std::atomic<size_t> totalIntermediates{0}; // incremented in emit2
     std::atomic<size_t> totalOutput{0};        // incremented in emit3
@@ -81,84 +75,176 @@ static void sysError(const char *msg)
     std::exit(1);
 }
 
-// Worker function
 static void worker(ThreadContext *tc)
 {
     JobContext *job = tc->job;
     int id = tc->id;
 
-    // ---- MAP PHASE ----
-    job->client->map(
-        nullptr, nullptr, nullptr); // ensure UNDEFINED_STAGE → MAP_STAGE
+    // — MAP —
     while (true)
     {
         size_t idx = job->mapIndex++;
         if (idx >= job->totalItems)
             break;
-        const auto &pair = job->input->at(idx);
-        job->client->map(pair.first, pair.second, tc);
+        const auto &kv = job->input->at(idx);
+        job->client->map(kv.first, kv.second, tc);
     }
 
-    // ---- SORT PHASE ----
-    std::sort(
-        job->intermediates[id].begin(),
-        job->intermediates[id].end(),
-        [](auto &a, auto &b)
-        { return *(a.first) < *(b.first); });
+    // — SORT —
+    auto &local = job->intermediates[id];
+    std::sort(local.begin(), local.end(),
+              [](auto &a, auto &b)
+              { return *(a.first) < *(b.first); });
 
-    // wait for everyone
+    // — BARRIER —
     job->barrier.barrier();
 
-    // ---- SHUFFLE PHASE (only thread 0) ----
+    // — SHUFFLE (thread 0 only) —
     if (id == 0)
     {
         for (;;)
         {
-            // assemble one key‐group from all intermediates
+            // find max key
+            K2 *maxKey = nullptr;
+            for (int t = 0; t < job->numThreads; ++t)
+            {
+                auto &v = job->intermediates[t];
+                if (!v.empty())
+                {
+                    K2 *k = v.back().first;
+                    if (!maxKey || *maxKey < *k)
+                        maxKey = k;
+                }
+            }
+            if (!maxKey)
+                break;
+
+            // gather all equal‐key entries
             IntermediateVec group;
             for (int t = 0; t < job->numThreads; ++t)
             {
-                auto &vec = job->intermediates[t];
-                if (vec.empty())
-                    continue;
-                auto kv = vec.back();
-                vec.pop_back();
-                group.push_back(kv);
+                auto &v = job->intermediates[t];
+                while (!v.empty())
+                {
+                    K2 *k = v.back().first;
+                    if (!(*k < *maxKey) && !(*maxKey < *k))
+                    {
+                        group.push_back(v.back());
+                        v.pop_back();
+                    }
+                    else
+                        break;
+                }
             }
-            if (group.empty())
-                break;
-            job->shuffleMux.lock();
-            job->shuffleQueue.push_back(std::move(group));
-            job->shuffleMux.unlock();
-            job->shuffledSoFar++;
+
+            // push to shared queue
+            {
+                std::lock_guard<std::mutex> lg(job->shuffleMux);
+                job->shuffleQueue.emplace_back(std::move(group));
+            }
         }
+        // signal reducers
+        job->shuffleComplete.store(true, std::memory_order_release);
     }
 
-    // ---- REDUCE PHASE ----
-    // spin until everything is shuffled
-    while (job->shuffledSoFar.load() < job->shuffleCount.load())
-    { /* busy‐wait */
+    // — REDUCE (all threads) —
+    // wait for shuffle to finish
+    while (!job->shuffleComplete.load(std::memory_order_acquire))
+    { /* spin */
     }
 
-    // now pop groups and reduce
+    // consume and reduce groups
     for (;;)
     {
-        job->shuffleMux.lock();
+        std::unique_lock<std::mutex> lk(job->shuffleMux);
         if (job->shuffleQueue.empty())
-        {
-            job->shuffleMux.unlock();
             break;
-        }
         auto group = std::move(job->shuffleQueue.back());
         job->shuffleQueue.pop_back();
-        job->shuffleMux.unlock();
+        lk.unlock();
 
         job->client->reduce(&group, tc);
     }
-
-    // swap output into the shared vector
-    // (emit3 will handle locking, see below)
 }
+
+// Worker function
+// static void worker(ThreadContext *tc)
+// {
+//     JobContext *job = tc->job;
+//     int id = tc->id;
+
+//     // ---- MAP PHASE ----
+//     job->client->map(
+//         nullptr, nullptr, nullptr); // ensure UNDEFINED_STAGE → MAP_STAGE
+//     while (true)
+//     {
+//         size_t idx = job->mapIndex++;
+//         if (idx >= job->totalItems)
+//             break;
+//         const auto &pair = job->input->at(idx);
+//         job->client->map(pair.first, pair.second, tc);
+//     }
+
+//     // ---- SORT PHASE ----
+//     std::sort(
+//         job->intermediates[id].begin(),
+//         job->intermediates[id].end(),
+//         [](auto &a, auto &b)
+//         { return *(a.first) < *(b.first); });
+
+//     // wait for everyone
+//     job->barrier.barrier();
+
+//     // ---- SHUFFLE PHASE (only thread 0) ----
+//     if (id == 0)
+//     {
+//         for (;;)
+//         {
+//             // assemble one key‐group from all intermediates
+//             IntermediateVec group;
+//             for (int t = 0; t < job->numThreads; ++t)
+//             {
+//                 auto &vec = job->intermediates[t];
+//                 if (vec.empty())
+//                     continue;
+//                 auto kv = vec.back();
+//                 vec.pop_back();
+//                 group.push_back(kv);
+//             }
+//             if (group.empty())
+//                 break;
+//             job->shuffleMux.lock();
+//             job->shuffleQueue.push_back(std::move(group));
+//             job->shuffleMux.unlock();
+//             job->shuffledSoFar++;
+//         }
+//     }
+
+//     // ---- REDUCE PHASE ----
+//     // spin until everything is shuffled
+//     while (job->shuffledSoFar.load() < job->shuffleCount.load())
+//     { /* busy‐wait */
+//     }
+
+//     // now pop groups and reduce
+//     for (;;)
+//     {
+//         job->shuffleMux.lock();
+//         if (job->shuffleQueue.empty())
+//         {
+//             job->shuffleMux.unlock();
+//             break;
+//         }
+//         auto group = std::move(job->shuffleQueue.back());
+//         job->shuffleQueue.pop_back();
+//         job->shuffleMux.unlock();
+
+//         job->client->reduce(&group, tc);
+//     }
+
+//     // swap output into the shared vector
+//     // (emit3 will handle locking, see below)
+// }
 
 // -- Framework API -------------------------------------------------
 
