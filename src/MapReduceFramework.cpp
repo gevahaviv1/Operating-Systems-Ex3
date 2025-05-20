@@ -271,7 +271,6 @@ void getJobState(JobHandle job, JobState *state)
         return;
     auto jc = static_cast<JobContext *>(job);
 
-    // snapshot all counters once
     size_t mapped = jc->mapIndex.load(std::memory_order_relaxed);
     size_t totalItems = jc->totalItems;
 
