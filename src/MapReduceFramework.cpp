@@ -12,14 +12,13 @@
 #include <cstdlib>
 #include <iostream>
 
-// forward‐declares from your file:
 struct ThreadContext;
 struct JobContext;
 
 struct ThreadContext
 {
-    JobContext *job; // back‐pointer
-    int id;          // 0 … multiThreadLevel-1
+    JobContext *job;
+    int id;
 };
 
 struct JobContext
@@ -102,7 +101,6 @@ static void worker(ThreadContext *tc)
     {
         for (;;)
         {
-            // find max key
             K2 *maxKey = nullptr;
             for (int t = 0; t < job->numThreads; ++t)
             {
@@ -117,7 +115,6 @@ static void worker(ThreadContext *tc)
             if (!maxKey)
                 break;
 
-            // gather all equal‐key entries
             IntermediateVec group;
             for (int t = 0; t < job->numThreads; ++t)
             {
@@ -143,7 +140,6 @@ static void worker(ThreadContext *tc)
             job->shuffledSoFar.fetch_add(group.size(), std::memory_order_relaxed);
             job->totalGroups.fetch_add(1, std::memory_order_relaxed);
         }
-        // signal reducers
         job->shuffleComplete.store(true, std::memory_order_release);
     }
 
@@ -172,7 +168,6 @@ JobHandle startMapReduceJob(const MapReduceClient &client,
                             OutputVec &outputVec,
                             int multiThreadLevel)
 {
-    // allocate and initialize
     JobContext *job = nullptr;
     try
     {
@@ -183,13 +178,11 @@ JobHandle startMapReduceJob(const MapReduceClient &client,
         sysError("allocating JobContext");
     }
 
-    // fill thread contexts
     for (int i = 0; i < multiThreadLevel; ++i)
     {
         job->tcs[i] = {job, i};
     }
 
-    // launch threads
     try
     {
         for (int i = 0; i < multiThreadLevel; ++i)
@@ -213,10 +206,8 @@ void emit2(K2 *key, V2 *value, void *context)
     auto tc = static_cast<ThreadContext *>(context);
     auto job = tc->job;
 
-    // 1) append into *this thread’s* intermediate buffer
     job->intermediates[tc->id].emplace_back(key, value);
 
-    // 2) bump total intermediates for progress
     job->totalIntermediates.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -228,13 +219,11 @@ void emit3(K3 *key, V3 *value, void *context)
     auto tc = static_cast<ThreadContext *>(context);
     auto job = tc->job;
 
-    // protect concurrent writes into the single outputVec
     {
         std::lock_guard<std::mutex> lg(job->outMux);
         job->output->emplace_back(key, value);
     }
 
-    // bump total outputs for progress
     job->reducedGroups.fetch_add(1, std::memory_order_relaxed);
     job->totalOutput.fetch_add(1, std::memory_order_relaxed);
 }
@@ -246,11 +235,9 @@ void waitForJob(JobHandle job)
 
     auto jc = static_cast<JobContext *>(job);
 
-    // ensure we only join the threads a single time
     bool expected = false;
     if (jc->threadsJoined.compare_exchange_strong(expected, true))
     {
-        // first caller will see expected==false, set it to true, and do the joins
         for (std::thread &t : jc->threads)
         {
             if (t.joinable())
@@ -262,7 +249,6 @@ void waitForJob(JobHandle job)
                   [](auto &a, auto &b)
                   { return *(a.first) < *(b.first); });
     }
-    // subsequent calls see threadsJoined==true and do nothing
 }
 
 void getJobState(JobHandle job, JobState *state)
@@ -293,7 +279,7 @@ void getJobState(JobHandle job, JobState *state)
         state->percentage = (mapped * 100.0f) / totalItems;
         return;
     }
-    // mapped == totalItems but shuffle not yet begun → give a final 100%
+
     if (totalGroups == 0)
     {
         state->stage = MAP_STAGE;
@@ -302,7 +288,6 @@ void getJobState(JobHandle job, JobState *state)
     }
 
     // --- Stage 2: SHUFFLE ---
-    // Stay in shuffle until *at least one* reduce() has run
     if (reduced == 0)
     {
         state->stage = SHUFFLE_STAGE;
@@ -329,10 +314,9 @@ void closeJobHandle(JobHandle job)
 {
     if (!job)
         return;
-    // wait for threads if needed
+
     waitForJob(job);
 
-    // free all resources
     auto jc = static_cast<JobContext *>(job);
     delete jc;
 }
