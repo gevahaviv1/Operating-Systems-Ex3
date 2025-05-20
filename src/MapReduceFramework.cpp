@@ -10,13 +10,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
-#include <iostream> // for system error reporting
+#include <iostream>
 
 // forward‐declares from your file:
 struct ThreadContext;
 struct JobContext;
-
-// -- Internals (not in the header) ----------------------------------
 
 struct ThreadContext
 {
@@ -52,6 +50,8 @@ struct JobContext
     // progress tracking
     std::atomic<size_t> mapIndex{0};
     std::atomic<size_t> shuffledSoFar{0};
+    std::atomic<size_t> totalGroups{0};
+    std::atomic<size_t> reducedGroups{0};
     std::atomic<bool> shuffleComplete{false};
     size_t totalItems;
 
@@ -67,7 +67,6 @@ struct JobContext
     }
 };
 
-// Helper: report and exit on system failure
 static void sysError(const char *msg)
 {
     std::cerr << "system error: " << msg << "\n";
@@ -142,6 +141,7 @@ static void worker(ThreadContext *tc)
                 job->shuffleQueue.emplace_back(std::move(group));
             }
             job->shuffledSoFar.fetch_add(group.size(), std::memory_order_relaxed);
+            job->totalGroups.fetch_add(1, std::memory_order_relaxed);
         }
         // signal reducers
         job->shuffleComplete.store(true, std::memory_order_release);
@@ -166,8 +166,6 @@ static void worker(ThreadContext *tc)
         job->client->reduce(&group, tc);
     }
 }
-
-// -- Framework API -------------------------------------------------
 
 JobHandle startMapReduceJob(const MapReduceClient &client,
                             const InputVec &inputVec,
@@ -207,7 +205,6 @@ JobHandle startMapReduceJob(const MapReduceClient &client,
     return static_cast<JobHandle>(job);
 }
 
-// Called by client.map(...) to emit (K2*,V2*)
 void emit2(K2 *key, V2 *value, void *context)
 {
     if (!context)
@@ -223,7 +220,6 @@ void emit2(K2 *key, V2 *value, void *context)
     job->totalIntermediates.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Called by client.reduce(...) to emit (K3*,V3*)
 void emit3(K3 *key, V3 *value, void *context)
 {
     if (!context)
@@ -239,6 +235,7 @@ void emit3(K3 *key, V3 *value, void *context)
     }
 
     // bump total outputs for progress
+    job->reducedGroups.fetch_add(1, std::memory_order_relaxed);
     job->totalOutput.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -268,131 +265,66 @@ void waitForJob(JobHandle job)
     // subsequent calls see threadsJoined==true and do nothing
 }
 
-// … your existing includes, forward‐decls, sysError(), emit2, emit3, waitForJob …
-
-// 1) First, make sure your JobContext has these members:
-//
-//    std::atomic<size_t> totalIntermediates{0};  // bumped in emit2
-//    std::atomic<size_t> totalOutput{0};         // bumped in emit3
-//
-// (you already added threadsJoined earlier)
-
 void getJobState(JobHandle job, JobState *state)
 {
     if (!job || !state)
         return;
     auto jc = static_cast<JobContext *>(job);
 
-    // 0% until any mapping begins
+    // snapshot all counters once
     size_t mapped = jc->mapIndex.load(std::memory_order_relaxed);
+    size_t totalItems = jc->totalItems;
+
+    size_t totalPairs = jc->totalIntermediates.load(std::memory_order_relaxed);
+    size_t shuffled = jc->shuffledSoFar.load(std::memory_order_relaxed);
+
+    size_t totalGroups = jc->totalGroups.load(std::memory_order_relaxed);
+    size_t reduced = jc->reducedGroups.load(std::memory_order_relaxed);
+
+    // --- Stage 1: MAP ---
     if (mapped == 0)
     {
-        state->stage = UNDEFINED_STAGE;
+        state->stage = MAP_STAGE;
         state->percentage = 0.0f;
         return;
     }
-
-    // MAP stage: still mapping input items
-    size_t totalItems = jc->totalItems;
     if (mapped < totalItems)
     {
         state->stage = MAP_STAGE;
         state->percentage = (mapped * 100.0f) / totalItems;
         return;
     }
+    // mapped == totalItems but shuffle not yet begun → give a final 100%
+    if (totalGroups == 0)
+    {
+        state->stage = MAP_STAGE;
+        state->percentage = 100.0f;
+        return;
+    }
 
-    // SHUFFLE stage: mapping done, but still shuffling intermediates
-    size_t shuffled = jc->shuffledSoFar.load(std::memory_order_relaxed);
-    size_t totalInt = jc->totalIntermediates.load(std::memory_order_relaxed);
-    if (shuffled < totalInt)
+    // --- Stage 2: SHUFFLE ---
+    // Stay in shuffle until *at least one* reduce() has run
+    if (reduced == 0)
     {
         state->stage = SHUFFLE_STAGE;
-        // guard divide‐by‐zero if no intermediates at all
-        state->percentage = totalInt
-                                ? (shuffled * 100.0f) / totalInt
+        state->percentage = totalPairs
+                                ? (shuffled * 100.0f) / totalPairs
                                 : 100.0f;
         return;
     }
 
-    // REDUCE stage: shuffling done, but still reducing
-    size_t reduced = jc->totalOutput.load(std::memory_order_relaxed);
-    if (reduced < totalInt)
+    // --- Stage 3: REDUCE ---
+    if (reduced < totalGroups)
     {
         state->stage = REDUCE_STAGE;
-        state->percentage = totalInt
-                                ? (reduced * 100.0f) / totalInt
-                                : 100.0f;
+        state->percentage = (reduced * 100.0f) / totalGroups;
+        return;
     }
-    else
-    {
-        // all done
-        state->stage = REDUCE_STAGE;
-        state->percentage = 100.0f;
-    }
+
+    // all done
+    state->stage = REDUCE_STAGE;
+    state->percentage = 100.0f;
 }
-
-// void getJobState(JobHandle job, JobState *state)
-// {
-//     if (!job || !state)
-//         return;
-//     auto jc = static_cast<JobContext *>(job);
-
-//     // Snapshot counters once
-//     size_t mapped = jc->mapIndex.load(std::memory_order_relaxed);
-//     size_t totalItems = jc->totalItems;
-//     size_t totalInt = jc->totalIntermediates.load(std::memory_order_relaxed);
-//     size_t shuffled = jc->shuffledSoFar.load(std::memory_order_relaxed);
-//     size_t reduced = jc->totalOutput.load(std::memory_order_relaxed);
-
-//     // 0) Before mapping starts
-//     if (mapped == 0)
-//     {
-//         state->stage = UNDEFINED_STAGE;
-//         state->percentage = 0.0f;
-//         return;
-//     }
-
-//     // 1) Map phase in progress
-//     if (mapped < totalItems)
-//     {
-//         state->stage = MAP_STAGE;
-//         state->percentage = (mapped * 100.0f) / totalItems;
-//         return;
-//     }
-
-//     // 2) Shuffle phase in progress
-//     if (shuffled < totalInt)
-//     {
-//         state->stage = SHUFFLE_STAGE;
-//         state->percentage = totalInt
-//                                 ? (shuffled * 100.0f) / totalInt
-//                                 : 100.0f;
-//         return;
-//     }
-
-//     // 2b) Shuffle just completed but reduce hasn't started
-//     //     Force a final 100% Shuffle print
-//     if (totalInt > 0 && reduced == 0)
-//     {
-//         state->stage = SHUFFLE_STAGE;
-//         state->percentage = 100.0f;
-//         return;
-//     }
-
-//     // 3) Reduce phase in progress
-//     if (reduced < totalInt)
-//     {
-//         state->stage = REDUCE_STAGE;
-//         state->percentage = totalInt
-//                                 ? (reduced * 100.0f) / totalInt
-//                                 : 100.0f;
-//         return;
-//     }
-
-//     // 4) All done
-//     state->stage = REDUCE_STAGE;
-//     state->percentage = 100.0f;
-// }
 
 void closeJobHandle(JobHandle job)
 {
